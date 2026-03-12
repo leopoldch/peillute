@@ -35,8 +35,12 @@ pub struct AppState {
     neighbours_socket: std::collections::HashMap<std::net::SocketAddr, std::net::SocketAddr>,
     /// Synchronization boolean
     sync_needed: bool,
+    /// Prevents scheduling multiple concurrent local sync snapshots
+    sync_snapshot_requested: bool,
     /// Number of attended neighbours at launch, for the discovery phase
     nb_first_attended_neighbours: i64,
+    /// Number of Discovery ACKs received so far
+    received_discovery_acks: i64,
 
     pub site_ids_to_adr: std::collections::HashMap<std::net::SocketAddr, String>,
 
@@ -85,7 +89,9 @@ impl AppState {
             connected_neighbours_addrs: in_use_neighbors,
             clocks,
             sync_needed: false,
+            sync_snapshot_requested: false,
             nb_first_attended_neighbours: 0,
+            received_discovery_acks: 0,
             global_mutex_fifo: gm,
             waiting_sc,
             in_sc,
@@ -148,15 +154,48 @@ impl AppState {
         self.sync_needed
     }
 
+    pub fn mark_sync_snapshot_requested(&mut self) -> bool {
+        if self.sync_snapshot_requested {
+            return false;
+        }
+        self.sync_snapshot_requested = true;
+        true
+    }
+
+    pub fn clear_sync_snapshot_requested(&mut self) {
+        self.sync_snapshot_requested = false;
+    }
+
+    /// Returns true when the site still needs its bootstrap synchronization.
+    pub fn needs_bootstrap_sync(&self) -> bool {
+        self.sync_needed
+    }
+
+    /// Marks the local site as synchronized after its bootstrap sync has completed.
+    pub fn mark_synchronized(&mut self) {
+        self.sync_needed = false;
+    }
+
     /// Set the number of attended neighbours at initialization
     pub fn init_nb_first_attended_neighbours(&mut self, nb: i64) {
         log::debug!("We will wait for {} attended neighbours", nb);
         self.nb_first_attended_neighbours = nb;
+        self.received_discovery_acks = 0;
     }
 
     /// Get the number of attended neighbours
     pub fn get_nb_first_attended_neighbours(&self) -> i64 {
         self.nb_first_attended_neighbours
+    }
+
+    /// Increment the number of received Discovery ACKs
+    pub fn increment_received_discovery_acks(&mut self) {
+        self.received_discovery_acks += 1;
+    }
+
+    /// Get the number of received Discovery ACKs
+    pub fn get_received_discovery_acks(&self) -> i64 {
+        self.received_discovery_acks
     }
 
     /// Initialize the parent of the current site as self for the wave protocol
@@ -175,12 +214,15 @@ impl AppState {
         new_addr: std::net::SocketAddr,
         new_socket: std::net::SocketAddr,
         received_clock: crate::clock::Clock,
-    ) {
+    ) -> bool {
         if !self.connected_neighbours_addrs.contains(&new_addr) {
             self.connected_neighbours_addrs.push(new_addr);
             self.clocks
                 .update_clock(self.site_id.clone().as_str(), Some(&received_clock));
             self.neighbours_socket.insert(new_socket, new_addr);
+            true
+        } else {
+            false
         }
     }
 
@@ -283,8 +325,7 @@ impl AppState {
 
         let should_diffuse = {
             // initialisation des paramètres avant la diffusion d'un message
-            self.set_parent_addr(self.site_id.to_string(), self.site_addr);
-            self.set_nb_nei_for_wave(self.site_id.to_string(), self.get_nb_connected_neighbours());
+            self.init_local_wave(&self.site_id.clone());
             self.get_nb_connected_neighbours() > 0
         };
 
@@ -334,8 +375,7 @@ impl AppState {
 
         let should_diffuse = {
             // initialisation des paramètres avant la diffusion d'un message
-            self.set_parent_addr(self.site_id.to_string(), self.site_addr);
-            self.set_nb_nei_for_wave(self.site_id.to_string(), self.get_nb_connected_neighbours());
+            self.init_local_wave(&self.site_id.clone());
             self.get_nb_connected_neighbours() > 0
         };
 
@@ -390,14 +430,10 @@ impl AppState {
             self.global_mutex_fifo
                 .retain(|_, s| s.tag != MutexTag::Release);
         } else {
-            println!("\x1b[1;31mSECTION CRITIQUE REFUSEE !\x1b[0m");
-            // print fifo order
-            println!("FIFO order:");
-            for (id, stamp) in &self.global_mutex_fifo {
-                println!("{}: {:?} - {:?}", id, stamp.tag, stamp.date);
-            }
-            // print my stamp
-            println!("{}: {:?} - {:?}", self.site_id, my_stamp.tag, my_stamp.date);
+            log::debug!(
+                "Critical section not entered yet for {}, waiting for FIFO order to progress",
+                self.site_id
+            );
         }
     }
 
@@ -448,6 +484,28 @@ impl AppState {
     pub fn set_nb_nei_for_wave(&mut self, initiator_id: String, n: i64) {
         self.attended_neighbours_nb_for_transaction_wave
             .insert(initiator_id, n);
+    }
+
+    /// Initialize a wave started by this site.
+    pub fn init_local_wave(&mut self, initiator_id: &str) {
+        self.set_parent_addr(initiator_id.to_string(), self.site_addr);
+        self.set_nb_nei_for_wave(
+            initiator_id.to_string(),
+            self.get_nb_connected_neighbours(),
+        );
+    }
+
+    /// Initialize a forwarded wave by storing its parent and expected children count.
+    pub fn init_forwarded_wave(&mut self, initiator_id: &str, parent_addr: std::net::SocketAddr) {
+        let expected_children = std::cmp::max(self.get_nb_connected_neighbours() - 1, 0);
+        self.set_parent_addr(initiator_id.to_string(), parent_addr);
+        self.set_nb_nei_for_wave(initiator_id.to_string(), expected_children);
+    }
+
+    /// Reset wave state once the diffusion has completed.
+    pub fn reset_wave(&mut self, initiator_id: &str) {
+        self.set_parent_addr(initiator_id.to_string(), "0.0.0.0:0".parse().unwrap());
+        self.set_nb_nei_for_wave(initiator_id.to_string(), 0);
     }
 
     /// Get the list of attended neighbors for the wave from initiator_id
@@ -538,5 +596,64 @@ mod tests {
         assert_eq!(shared_state.cli_peer_addrs.len() as i64, num_sites);
         assert_eq!(shared_state.cli_peer_addrs, peer_addrs);
         assert_eq!(shared_state.clocks.get_vector_clock_map().len(), 0); // Initially empty
+    }
+
+    #[test]
+    fn forwarded_wave_excludes_parent_and_resets_cleanly() {
+        let mut state = AppState::new(
+            "A".to_string(),
+            vec![],
+            "127.0.0.1:8080".parse().unwrap(),
+        );
+        state.set_nb_connected_neighbours(3);
+
+        state.init_forwarded_wave("root", "127.0.0.1:8081".parse().unwrap());
+
+        assert_eq!(
+            state.get_parent_addr_for_wave("root".to_string()),
+            "127.0.0.1:8081".parse().unwrap()
+        );
+        assert_eq!(state.get_nb_nei_for_wave().get("root").copied(), Some(2));
+
+        state.reset_wave("root");
+
+        assert_eq!(
+            state.get_parent_addr_for_wave("root".to_string()),
+            "0.0.0.0:0".parse().unwrap()
+        );
+        assert_eq!(state.get_nb_nei_for_wave().get("root").copied(), Some(0));
+    }
+
+    #[test]
+    fn sync_snapshot_request_is_deduplicated_until_cleared() {
+        let mut state = AppState::new(
+            "A".to_string(),
+            vec![],
+            "127.0.0.1:8080".parse().unwrap(),
+        );
+
+        assert!(state.mark_sync_snapshot_requested());
+        assert!(!state.mark_sync_snapshot_requested());
+
+        state.clear_sync_snapshot_requested();
+
+        assert!(state.mark_sync_snapshot_requested());
+    }
+
+    #[test]
+    fn init_nb_first_attended_neighbours_resets_received_discovery_acks() {
+        let mut state = AppState::new(
+            "A".to_string(),
+            vec![],
+            "127.0.0.1:8080".parse().unwrap(),
+        );
+
+        state.increment_received_discovery_acks();
+        assert_eq!(state.get_received_discovery_acks(), 1);
+
+        state.init_nb_first_attended_neighbours(3);
+
+        assert_eq!(state.get_nb_first_attended_neighbours(), 3);
+        assert_eq!(state.get_received_discovery_acks(), 0);
     }
 }

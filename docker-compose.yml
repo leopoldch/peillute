@@ -19,7 +19,6 @@ services:
   n2:
     image: peillute:latest
     container_name: n2
-    entrypoint: ["/bin/sh","-c","sleep 1 && /usr/local/bin/entrypoint.sh"]
     environment:
       CLI_IP: 172.18.0.3
       CLI_PORT: 10001
@@ -36,7 +35,6 @@ services:
   n3:
     image: peillute:latest
     container_name: n3
-    entrypoint: ["/bin/sh","-c","sleep 2 && /usr/local/bin/entrypoint.sh"]
     environment:
       CLI_IP: 172.18.0.4
       CLI_PORT: 10002

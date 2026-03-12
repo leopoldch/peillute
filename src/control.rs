@@ -157,18 +157,44 @@ pub enum CriticalCommands {
 /// Enqueue a critical command
 pub async fn enqueue_critical(cmd: CriticalCommands) -> Result<(), Box<dyn std::error::Error>> {
     use crate::state::LOCAL_APP_STATE;
+    let is_sync_snapshot = cmd == CriticalCommands::SyncSnapshot;
+    let mut sync_backoff_ms = 0u64;
+
+    {
+        let mut st = LOCAL_APP_STATE.lock().await;
+
+        if is_sync_snapshot {
+            if !st.mark_sync_snapshot_requested() {
+                log::debug!("SyncSnapshot already requested locally, skipping duplicate enqueue");
+                return Ok(());
+            }
+            if st.needs_bootstrap_sync() {
+                // Deterministically stagger bootstrap syncs for reloaded sites so their
+                // snapshot waves do not all contend at once during cluster restart.
+                sync_backoff_ms = (st.get_site_addr().port() as u64 % 100) * 1500;
+            }
+        }
+
+        st.pending_commands.push_back(cmd);
+
+        // si on n’est ni en SC ni déjà en attente → on déclenche la vague
+        log::debug!("is in sc {}", !st.in_sc);
+        log::debug!("is waiting {}", !st.waiting_sc);
+
+        if st.in_sc || st.waiting_sc {
+            return Ok(());
+        }
+    }
+
+    if sync_backoff_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(sync_backoff_ms)).await;
+    }
+
     let mut st = LOCAL_APP_STATE.lock().await;
-
-    st.pending_commands.push_back(cmd);
-
-    // si on n’est ni en SC ni déjà en attente → on déclenche la vague
-
-    log::debug!("is in sc {}", !st.in_sc);
-    log::debug!("is waiting {}", !st.waiting_sc);
-
-    if !st.in_sc && !st.waiting_sc {
+    if !st.in_sc && !st.waiting_sc && !st.pending_commands.is_empty() {
         st.acquire_mutex().await?;
     }
+
     Ok(())
 }
 
@@ -191,6 +217,7 @@ pub async fn execute_critical(cmd: CriticalCommands) -> Result<(), Box<dyn std::
     };
 
     let msg;
+    let mut clears_local_sync_flag = false;
 
     match cmd {
         CriticalCommands::CreateUser { name } => {
@@ -340,6 +367,7 @@ pub async fn execute_critical(cmd: CriticalCommands) -> Result<(), Box<dyn std::
         CriticalCommands::SyncSnapshot => {
             use crate::snapshot;
             snapshot::start_snapshot(snapshot::SnapshotMode::SyncMode).await?;
+            clears_local_sync_flag = true;
 
             msg = Message {
                 command: None,
@@ -357,10 +385,8 @@ pub async fn execute_critical(cmd: CriticalCommands) -> Result<(), Box<dyn std::
     let should_diffuse = {
         // initialisation des paramètres avant la diffusion d'un message
         let mut state = LOCAL_APP_STATE.lock().await;
-        let nb_neigh = state.get_nb_connected_neighbours();
-        state.set_parent_addr(site_id.to_string(), site_addr);
-        state.set_nb_nei_for_wave(site_id.to_string(), nb_neigh);
-        nb_neigh > 0
+        state.init_local_wave(&site_id);
+        state.get_nb_connected_neighbours() > 0
     };
 
     if should_diffuse {
@@ -369,6 +395,10 @@ pub async fn execute_critical(cmd: CriticalCommands) -> Result<(), Box<dyn std::
         // pas release depuis le réseau si on est tout seul
         // on doit relacher le mutex directement
         let mut state = LOCAL_APP_STATE.lock().await;
+        if clears_local_sync_flag {
+            state.clear_sync_snapshot_requested();
+            state.mark_synchronized();
+        }
         let _ = state.release_mutex().await;
     };
     Ok(())
